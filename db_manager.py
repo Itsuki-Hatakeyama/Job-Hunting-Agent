@@ -9,7 +9,7 @@ db_manager.py
 
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -35,13 +35,14 @@ CREATE TABLE IF NOT EXISTS companies (
 
 CREATE TABLE IF NOT EXISTS events (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    company_id     INTEGER NOT NULL,
+    company_id     INTEGER,
     event_type     TEXT NOT NULL,
     start_datetime TEXT NOT NULL,
     end_datetime   TEXT,
     mail_summary   TEXT,
     mail_raw       TEXT,
     is_completed   INTEGER DEFAULT 0,
+    is_todo        INTEGER DEFAULT 0,
     gmail_msg_id   TEXT,
     FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
 );
@@ -49,6 +50,15 @@ CREATE TABLE IF NOT EXISTS events (
 
 # 有効なステータス一覧
 VALID_STATUSES = ["選考中", "結果待ち", "結果", "お見送り"]
+
+# ─────────────────────────────────────────────
+# 提出物判定キーワード（キーワード判定層）
+# ─────────────────────────────────────────────
+TODO_KEYWORDS = [
+    "ES", "エントリーシート", "締切", "提出", "エントリー",
+    "応募書類", "履歴書", "適性検査", "Webテスト", "SPI",
+    "締め切り", "期限", "提出期限", "書類選考",
+]
 
 
 # ─────────────────────────────────────────────
@@ -74,14 +84,19 @@ def get_connection():
 def init_db() -> None:
     """DBファイルを作成し、テーブルを初期化する（冪等）。既存DBにはカラム追加マイグレーションも行う。"""
     with get_connection() as conn:
-        # テーブル作成（既存テーブルはスキップ）
         conn.executescript(DDL)
-        # 既存テーブルへの gmail_msg_id カラム追加（既にあればエラーを無視）
-        try:
-            conn.execute("ALTER TABLE events ADD COLUMN gmail_msg_id TEXT")
-        except Exception:
-            pass
-        # ユニークインデックス作成（カラム追加後に実行）
+
+        # 既存テーブルへのマイグレーション（カラムが無ければ追加）
+        for col, definition in [
+            ("gmail_msg_id", "TEXT"),
+            ("is_todo",      "INTEGER DEFAULT 0"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE events ADD COLUMN {col} {definition}")
+            except Exception:
+                pass
+
+        # ユニークインデックス
         try:
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_gmail_msg_id "
@@ -89,6 +104,7 @@ def init_db() -> None:
             )
         except Exception:
             pass
+
     print(f"[DB] 初期化完了: {DB_PATH.resolve()}")
 
 
@@ -167,16 +183,16 @@ def delete_company(company_id: int) -> None:
 # ─────────────────────────────────────────────
 
 def insert_event(
-    company_id: int,
+    company_id: Optional[int],
     event_type: str,
     start_datetime: str,
     end_datetime: Optional[str] = None,
     mail_summary: Optional[str] = None,
     mail_raw: Optional[str] = None,
     gmail_msg_id: Optional[str] = None,
+    is_todo: int = 0,
 ) -> int:
     """選考イベントを1件挿入する。gmail_msg_id が既存の場合は挿入をスキップして既存 id を返す。Returns: event_id"""
-    # 開始日時が過去か判定して is_completed をセット
     try:
         start_dt = datetime.fromisoformat(start_datetime)
         is_completed = 1 if start_dt < datetime.now(tz=start_dt.tzinfo) else 0
@@ -184,7 +200,6 @@ def insert_event(
         is_completed = 0
 
     with get_connection() as conn:
-        # Gmail メッセージ ID による重複チェック
         if gmail_msg_id:
             existing = conn.execute(
                 "SELECT id FROM events WHERE gmail_msg_id = ?", (gmail_msg_id,)
@@ -196,11 +211,11 @@ def insert_event(
             """
             INSERT INTO events
                 (company_id, event_type, start_datetime, end_datetime,
-                 mail_summary, mail_raw, is_completed, gmail_msg_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 mail_summary, mail_raw, is_completed, is_todo, gmail_msg_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (company_id, event_type, start_datetime, end_datetime,
-             mail_summary, mail_raw, is_completed, gmail_msg_id),
+             mail_summary, mail_raw, is_completed, is_todo, gmail_msg_id),
         )
         return cur.lastrowid
 
@@ -218,15 +233,175 @@ def get_events_by_company(company_id: int) -> list[dict]:
 def refresh_completed_flags() -> int:
     """
     現在日時より過去の start_datetime を持つイベントの is_completed を 1 に更新する。
+    ただし is_todo=1（提出物）は手動チェックのみで完了とするため除外する。
     Returns: 更新件数
     """
     now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     with get_connection() as conn:
         cur = conn.execute(
-            "UPDATE events SET is_completed = 1 WHERE start_datetime < ? AND is_completed = 0",
+            """UPDATE events SET is_completed = 1
+               WHERE start_datetime < ? AND is_completed = 0 AND is_todo = 0""",
             (now_str,),
         )
         return cur.rowcount
+
+
+# ─────────────────────────────────────────────
+# ダッシュボード用クエリ
+# ─────────────────────────────────────────────
+
+def get_upcoming_events(days: int = 7) -> list[dict]:
+    """
+    今日から指定日数以内の未完了イベント（is_todo=0）を日付昇順で返す。
+    企業名も JOIN して付与する。
+    """
+    now_str  = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    end_str  = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT e.*, c.name AS company_name
+            FROM events e
+            LEFT JOIN companies c ON e.company_id = c.id
+            WHERE e.start_datetime >= ?
+              AND e.start_datetime <= ?
+              AND e.is_todo = 0
+            ORDER BY e.start_datetime ASC
+            """,
+            (now_str, end_str),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_pending_todos() -> list[dict]:
+    """
+    未完了の提出物タスク（is_todo=1, is_completed=0）を締切が近い順で返す。
+    企業名も JOIN して付与する。
+    """
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT e.*, c.name AS company_name
+            FROM events e
+            LEFT JOIN companies c ON e.company_id = c.id
+            WHERE e.is_todo = 1 AND e.is_completed = 0
+            ORDER BY e.start_datetime ASC
+            """,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def complete_todo(event_id: int) -> None:
+    """提出物タスクを手動で完了済みにする（is_completed = 1）。"""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE events SET is_completed = 1 WHERE id = ? AND is_todo = 1",
+            (event_id,),
+        )
+
+
+def insert_manual_todo(
+    company_name: Optional[str],
+    title: str,
+    deadline_datetime: str,
+) -> dict:
+    """
+    手動で提出物タスクを追加する。
+    company_name が指定されれば companies を upsert して紐付ける。
+    Returns: {"company_id": int|None, "event_id": int}
+    """
+    company_id = None
+    if company_name and company_name.strip():
+        company_id = upsert_company(company_name.strip())
+
+    event_id = insert_event(
+        company_id=company_id,
+        event_type=title,
+        start_datetime=deadline_datetime,
+        is_todo=1,
+    )
+    return {"company_id": company_id, "event_id": event_id}
+
+
+# ─────────────────────────────────────────────
+# カレンダー用クエリ
+# ─────────────────────────────────────────────
+
+def get_events_for_month(year: int, month: int) -> list[dict]:
+    """
+    指定年月のイベントを全て取得する（is_todo 問わず）。
+    企業名も JOIN して付与する。
+    """
+    start_str = f"{year:04d}-{month:02d}-01T00:00:00"
+    # 月末算出
+    if month == 12:
+        end_str = f"{year+1:04d}-01-01T00:00:00"
+    else:
+        end_str = f"{year:04d}-{month+1:02d}-01T00:00:00"
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT e.*, c.name AS company_name
+            FROM events e
+            LEFT JOIN companies c ON e.company_id = c.id
+            WHERE e.start_datetime >= ?
+              AND e.start_datetime <  ?
+            ORDER BY e.start_datetime ASC
+            """,
+            (start_str, end_str),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_events_for_week(year: int, month: int, day: int) -> list[dict]:
+    """
+    指定日を含む週（月曜始まり）のイベントを取得する。
+    企業名も JOIN して付与する。
+    """
+    from datetime import date, timedelta
+    d         = date(year, month, day)
+    week_start = d - timedelta(days=d.weekday())   # 月曜
+    week_end   = week_start + timedelta(days=7)
+
+    start_str = week_start.strftime("%Y-%m-%dT00:00:00")
+    end_str   = week_end.strftime("%Y-%m-%dT00:00:00")
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT e.*, c.name AS company_name
+            FROM events e
+            LEFT JOIN companies c ON e.company_id = c.id
+            WHERE e.start_datetime >= ?
+              AND e.start_datetime <  ?
+            ORDER BY e.start_datetime ASC
+            """,
+            (start_str, end_str),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_events_for_day(year: int, month: int, day: int) -> list[dict]:
+    """
+    指定日のイベントを取得する。企業名も JOIN して付与する。
+    """
+    start_str = f"{year:04d}-{month:02d}-{day:02d}T00:00:00"
+    end_str   = f"{year:04d}-{month:02d}-{day:02d}T23:59:59"
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT e.*, c.name AS company_name
+            FROM events e
+            LEFT JOIN companies c ON e.company_id = c.id
+            WHERE e.start_datetime >= ?
+              AND e.start_datetime <= ?
+            ORDER BY e.start_datetime ASC
+            """,
+            (start_str, end_str),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 # ─────────────────────────────────────────────
@@ -241,19 +416,18 @@ def save_email_event(
     mail_summary: Optional[str] = None,
     mail_raw: Optional[str] = None,
     gmail_msg_id: Optional[str] = None,
+    is_todo: int = 0,
 ) -> dict:
     """
     フェーズ1のLLM解析結果を受け取り、companies と events に保存する。
-    面接系のイベント種別が検知された場合、企業ステータスを「面接待ち」に自動更新する。
+    面接系のイベント種別が検知された場合、企業ステータスを「結果待ち」に自動更新する。
 
     Returns: {"company_id": int, "event_id": int, "status_updated": bool}
     """
     INTERVIEW_KEYWORDS = ["面接", "interview"]
 
-    # 1. 企業を upsert
     company_id = upsert_company(company_name)
 
-    # 2. イベントを追加
     event_id = insert_event(
         company_id=company_id,
         event_type=event_type,
@@ -262,13 +436,12 @@ def save_email_event(
         mail_summary=mail_summary,
         mail_raw=mail_raw,
         gmail_msg_id=gmail_msg_id,
+        is_todo=is_todo,
     )
 
-    # 3. 面接系キーワードが含まれていればステータスを自動更新
     status_updated = False
     if any(kw in event_type for kw in INTERVIEW_KEYWORDS):
         current = get_company(company_id)
-        # 内定・お見送り済みの企業は上書きしない
         if current and current["status"] not in ("結果", "お見送り"):
             update_company_status(company_id, "結果待ち")
             status_updated = True
@@ -287,7 +460,6 @@ def save_email_event(
 if __name__ == "__main__":
     init_db()
 
-    # ─── デモ用シードデータ（初回のみ投入）───
     _demo = [
         {
             "company": "株式会社テックコーポ",
@@ -296,6 +468,7 @@ if __name__ == "__main__":
             "end":   "2026-06-01T14:00:00+09:00",
             "summary": "1次面接のご案内。オンライン（Zoom）にて実施。",
             "raw": "件名: 【重要】1次面接のご案内\n...\nZoomのURLは別途お送りします。",
+            "is_todo": 0,
         },
         {
             "company": "株式会社テックコーポ",
@@ -304,14 +477,16 @@ if __name__ == "__main__":
             "end":   "2026-05-10T12:00:00+09:00",
             "summary": "会社説明会（録画あり）に参加済み。",
             "raw": "件名: 説明会のご案内\n...",
+            "is_todo": 0,
         },
         {
             "company": "グローバル商事株式会社",
             "event_type": "ES締切",
-            "start": "2026-05-28T23:59:00+09:00",
+            "start": "2026-06-10T23:59:00+09:00",
             "end": None,
             "summary": "エントリーシート提出締切。マイページより提出。",
             "raw": "件名: エントリーシート提出のお願い\n...",
+            "is_todo": 1,
         },
         {
             "company": "未来ベンチャーズ",
@@ -320,6 +495,7 @@ if __name__ == "__main__":
             "end":   "2026-06-10T16:30:00+09:00",
             "summary": "最終面接のご案内（対面・本社にて）。",
             "raw": "件名: 最終面接ご案内\n...",
+            "is_todo": 0,
         },
         {
             "company": "創造エンジニアリング",
@@ -328,6 +504,34 @@ if __name__ == "__main__":
             "end": None,
             "summary": "内定のご連絡。承諾期限は6月末。",
             "raw": "件名: 採用内定のご通知\n...",
+            "is_todo": 0,
+        },
+        {
+            "company": "フューチャー株式会社",
+            "event_type": "Webテスト締切",
+            "start": "2026-06-09T23:59:00+09:00",
+            "end": None,
+            "summary": "SPI Webテストの受験期限。",
+            "raw": "件名: Webテスト受験のご案内\n...",
+            "is_todo": 1,
+        },
+        {
+            "company": "グリーンテック",
+            "event_type": "2次面接",
+            "start": "2026-06-11T11:00:00+09:00",
+            "end":   "2026-06-11T12:00:00+09:00",
+            "summary": "2次面接のご案内。",
+            "raw": "件名: 2次面接のご案内\n...",
+            "is_todo": 0,
+        },
+        {
+            "company": "合同説明会",
+            "event_type": "合同企業説明会",
+            "start": "2026-06-08T13:00:00+09:00",
+            "end":   "2026-06-08T17:00:00+09:00",
+            "summary": "○○大学主催 合同企業説明会。",
+            "raw": "件名: 合同説明会のご案内\n...",
+            "is_todo": 0,
         },
     ]
 
@@ -339,10 +543,10 @@ if __name__ == "__main__":
             end_datetime=d["end"],
             mail_summary=d["summary"],
             mail_raw=d["raw"],
+            is_todo=d["is_todo"],
         )
         print(f"  [SEED] {d['company']} / {d['event_type']} → {result}")
 
-    # 内定企業はステータスを手動で更新
     all_cos = get_all_companies()
     for c in all_cos:
         if c["name"] == "創造エンジニアリング":

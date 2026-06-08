@@ -324,6 +324,87 @@ def insert_manual_todo(
 
 
 # ─────────────────────────────────────────────
+# カレンダー用クエリ
+# ─────────────────────────────────────────────
+
+def get_events_for_month(year: int, month: int) -> list[dict]:
+    """
+    指定年月のイベントを全て取得する（is_todo 問わず）。
+    企業名も JOIN して付与する。
+    """
+    start_str = f"{year:04d}-{month:02d}-01T00:00:00"
+    # 月末算出
+    if month == 12:
+        end_str = f"{year+1:04d}-01-01T00:00:00"
+    else:
+        end_str = f"{year:04d}-{month+1:02d}-01T00:00:00"
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT e.*, c.name AS company_name
+            FROM events e
+            LEFT JOIN companies c ON e.company_id = c.id
+            WHERE e.start_datetime >= ?
+              AND e.start_datetime <  ?
+            ORDER BY e.start_datetime ASC
+            """,
+            (start_str, end_str),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_events_for_week(year: int, month: int, day: int) -> list[dict]:
+    """
+    指定日を含む週（月曜始まり）のイベントを取得する。
+    企業名も JOIN して付与する。
+    """
+    from datetime import date, timedelta
+    d         = date(year, month, day)
+    week_start = d - timedelta(days=d.weekday())   # 月曜
+    week_end   = week_start + timedelta(days=7)
+
+    start_str = week_start.strftime("%Y-%m-%dT00:00:00")
+    end_str   = week_end.strftime("%Y-%m-%dT00:00:00")
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT e.*, c.name AS company_name
+            FROM events e
+            LEFT JOIN companies c ON e.company_id = c.id
+            WHERE e.start_datetime >= ?
+              AND e.start_datetime <  ?
+            ORDER BY e.start_datetime ASC
+            """,
+            (start_str, end_str),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_events_for_day(year: int, month: int, day: int) -> list[dict]:
+    """
+    指定日のイベントを取得する。企業名も JOIN して付与する。
+    """
+    start_str = f"{year:04d}-{month:02d}-{day:02d}T00:00:00"
+    end_str   = f"{year:04d}-{month:02d}-{day:02d}T23:59:59"
+
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT e.*, c.name AS company_name
+            FROM events e
+            LEFT JOIN companies c ON e.company_id = c.id
+            WHERE e.start_datetime >= ?
+              AND e.start_datetime <= ?
+            ORDER BY e.start_datetime ASC
+            """,
+            (start_str, end_str),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ─────────────────────────────────────────────
 # フェーズ1連携用：メール解析結果をDBに書き込む
 # ─────────────────────────────────────────────
 

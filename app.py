@@ -65,6 +65,9 @@ LANES = ["選考中", "結果待ち", "結果", "お見送り"]
 SCHEDULE_KEYWORDS_SELECTION = ["面接", "選考", "ES", "締切", "Webテスト", "SPI", "適性", "インターン", "GD", "内定", "提出", "エントリー"]
 SCHEDULE_KEYWORDS_BRIEFING  = ["説明会", "セミナー", "イベント", "合同", "就活イベント"]
 
+# カンバンに表示しない企業名のパターン（単発イベント用の仮企業名）
+KANBAN_EXCLUDE_EVENT_TYPES = ["説明会", "セミナー", "合同", "就活イベント"]
+
 
 # ─────────────────────────────────────────────
 # Flet ショートハンド
@@ -2014,13 +2017,46 @@ def main(page: ft.Page):
         content=ft.Container(width=380, expand=True, content=detail_inner),
     )
 
-    def refresh_lanes(keep=False):
+    def _is_kanban_company(company: dict) -> bool:
+        """
+        カンバンに表示すべき企業かどうかを判定する。
+        全イベントが説明会・セミナー系のみの企業は除外する。
+        """
+        events = db.get_events_by_company(company["id"])
+        if not events:
+            return True  # イベントなし → 表示する
+        for ev in events:
+            et = ev.get("event_type", "")
+            if not any(kw in et for kw in KANBAN_EXCLUDE_EVENT_TYPES):
+                return True  # 選考系イベントが1件でもあれば表示
+        return False
+
+    def refresh_lanes(keep=False, animated=False):
+        """
+        animated=True のとき、まず旧カードをフェードアウト（height→0）してから
+        短い遅延後に新レーンに再描画する（スライド移動の演出）。
+        """
+        import time
+
+        if animated:
+            # フェードアウト：全カードの margin-bottom を 0 にして縮ませる
+            for lane in LANES:
+                for ctrl in lane_cols[lane].controls:
+                    if hasattr(ctrl, "margin"):
+                        ctrl.margin = mar(bottom=0)
+            page.update()
+            time.sleep(0.18)   # アニメーション待機（0.18秒）
+
         companies = db.get_all_companies()
         for lane in LANES:
             lane_cols[lane].controls.clear()
         for co in companies:
+            if not _is_kanban_company(co):
+                continue
             s = co["status"] if co["status"] in LANES else "選考中"
-            lane_cols[s].controls.append(build_company_card(co, on_card_click))
+            lane_cols[s].controls.append(
+                build_company_card(co, on_card_click)
+            )
         if keep and selected_id[0]:
             co = db.get_company(selected_id[0])
             if co:
@@ -2075,7 +2111,11 @@ def main(page: ft.Page):
 
     def handle_status_change(company_id, new_status):
         db.update_company_status(company_id, new_status)
-        refresh_lanes(keep=True)
+        # animated=True でカード移動をスライド演出
+        threading.Thread(
+            target=lambda: refresh_lanes(keep=True, animated=True),
+            daemon=True,
+        ).start()
 
     # ── 同期 ──
     def handle_sync(e, initial_mode: bool = False):
@@ -2129,6 +2169,42 @@ def main(page: ft.Page):
                     ],
                 ),
                 ft.Container(expand=True),
+                # ➕ 予定追加ボタン（カレンダーの追加ダイアログを呼ぶ）
+                ft.OutlinedButton(
+                    content=ft.Row(
+                        spacing=5, tight=True,
+                        controls=[
+                            ft.Icon(ft.Icons.ADD_ROUNDED, size=15, color=C["green"]),
+                            ft.Text("予定追加", size=12, weight=ft.FontWeight.W_600,
+                                    color=C["green"]),
+                        ],
+                    ),
+                    on_click=lambda e: build_add_event_dialog(
+                        page,
+                        lambda co, et, s, end: (
+                            db.insert_event(
+                                company_id=db.upsert_company(co) if co else None,
+                                event_type=et,
+                                start_datetime=s,
+                                end_datetime=end,
+                            ),
+                            threading.Thread(
+                                target=gcal_create_event,
+                                args=(et, co or "就活", s, end or s),
+                                daemon=True,
+                            ).start(),
+                            show_snack(page, "✅ 予定を追加しました",
+                                       color="white", bg=C["green"]),
+                            refresh_lanes(keep=True),
+                        )[-1],
+                    ),
+                    style=ft.ButtonStyle(
+                        side=ft.BorderSide(1.5, C["green"]),
+                        shape=ft.RoundedRectangleBorder(radius=10),
+                        padding=pad_sym(h=14, v=10),
+                    ),
+                ),
+                ft.Container(width=8),
                 ft.OutlinedButton(
                     content=ft.Row(
                         spacing=5, tight=True,

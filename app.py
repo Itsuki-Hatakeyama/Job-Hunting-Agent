@@ -1009,6 +1009,978 @@ def build_detail_panel(company, on_status_change, on_close, page):
 
 
 # ─────────────────────────────────────────────
+# Google Calendar API クライアント（双方向同期用）
+# ─────────────────────────────────────────────
+
+def _get_gcal_service():
+    """
+    Google Calendar API サービスオブジェクトを返す。
+    token.json が存在しない場合は None を返す（認証未完了）。
+    """
+    try:
+        from pathlib import Path
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        from googleapiclient.discovery import build
+
+        TOKEN_FILE = Path("token.json")
+        SCOPES = [
+            "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/calendar.events",
+        ]
+        if not TOKEN_FILE.exists():
+            return None
+        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        if not creds or not creds.valid:
+            return None
+        return build("calendar", "v3", credentials=creds)
+    except Exception:
+        return None
+
+
+def gcal_create_event(event_type: str, company_name: str,
+                      start_iso: str, end_iso: str) -> str | None:
+    """
+    Google Calendar にイベントを作成し、gcal_event_id を返す。
+    失敗時は None。
+    """
+    svc = _get_gcal_service()
+    if not svc:
+        return None
+    try:
+        from datetime import datetime, timedelta
+        start_dt = datetime.fromisoformat(start_iso)
+        try:
+            end_dt = datetime.fromisoformat(end_iso)
+        except Exception:
+            end_dt = start_dt + timedelta(hours=1)
+
+        kind   = classify_event(event_type)
+        prefix = "【締切】" if kind == "todo" else ""
+        title  = f"{prefix}[{company_name}] {event_type}"
+
+        body = {
+            "summary": title,
+            "start": {"dateTime": start_dt.isoformat(), "timeZone": "Asia/Tokyo"},
+            "end":   {"dateTime": end_dt.isoformat(),   "timeZone": "Asia/Tokyo"},
+        }
+        result = svc.events().insert(calendarId="primary", body=body).execute()
+        return result.get("id")
+    except Exception:
+        return None
+
+
+def gcal_fetch_month(year: int, month: int) -> list[dict]:
+    """
+    Google Calendar から指定月のイベントを取得して返す。
+    [{title, start_iso, end_iso, gcal_id}, ...]
+    失敗時は空リスト。
+    """
+    svc = _get_gcal_service()
+    if not svc:
+        return []
+    try:
+        import calendar as _cal
+        last_day = _cal.monthrange(year, month)[1]
+        time_min = f"{year:04d}-{month:02d}-01T00:00:00+09:00"
+        time_max = f"{year:04d}-{month:02d}-{last_day:02d}T23:59:59+09:00"
+
+        result = svc.events().list(
+            calendarId="primary",
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=250,
+        ).execute()
+
+        items = []
+        for ev in result.get("items", []):
+            start = ev.get("start", {})
+            end   = ev.get("end",   {})
+            items.append({
+                "title":     ev.get("summary", ""),
+                "start_iso": start.get("dateTime") or start.get("date", ""),
+                "end_iso":   end.get("dateTime")   or end.get("date", ""),
+                "gcal_id":   ev.get("id", ""),
+            })
+        return items
+    except Exception:
+        return []
+
+
+# ─────────────────────────────────────────────
+# カレンダー：イベント色・分類ヘルパー
+# ─────────────────────────────────────────────
+
+def cal_event_color(event_type: str) -> tuple[str, str]:
+    """(fg_color, bg_color) を返す。選考系=青 / 説明会系=橙 / 提出物=赤。"""
+    et = event_type or ""
+    if any(kw in et for kw in ["締切", "提出", "Webテスト", "SPI", "ES", "適性", "エントリー"]):
+        return C["red"],    C["red_light"]
+    if any(kw in et for kw in SCHEDULE_KEYWORDS_BRIEFING):
+        return C["orange"], C["orange_light"]
+    return C["blue"],   C["blue_light"]
+
+
+# ─────────────────────────────────────────────
+# カレンダー：ポップアップ
+# ─────────────────────────────────────────────
+
+def build_cal_popup(ev: dict, on_open_detail, on_close_popup, page) -> ft.Container:
+    """
+    カレンダーのマス目クリック時に表示する吹き出しポップアップ。
+    選考系の企業が紐付く場合は「詳細を見る」ボタンも表示する。
+    """
+    fg, bg = cal_event_color(ev.get("event_type", ""))
+    co     = ev.get("company_name") or ""
+    et     = ev.get("event_type", "")
+    dt_str = fmt_dt(ev.get("start_datetime"))
+    end_str = fmt_dt(ev.get("end_datetime")) if ev.get("end_datetime") else ""
+    time_range = f"{dt_str}" + (f" 〜 {end_str}" if end_str else "")
+
+    controls = [
+        ft.Row(
+            spacing=8,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            controls=[
+                ft.Container(
+                    content=ft.Text(et[:14], size=12, weight=ft.FontWeight.W_700, color=fg),
+                    bgcolor=bg, border_radius=6, padding=pad_sym(h=8, v=4),
+                ),
+                ft.Container(expand=True),
+                ft.IconButton(
+                    icon=ft.Icons.CLOSE_ROUNDED,
+                    icon_size=14, icon_color=C["text_muted"],
+                    on_click=lambda e: on_close_popup(),
+                    padding=pad_all(0),
+                ),
+            ],
+        ),
+    ]
+
+    if co:
+        controls.append(
+            ft.Text(co, size=13, weight=ft.FontWeight.W_700, color=C["text_primary"])
+        )
+
+    controls.append(
+        ft.Text(time_range, size=11, color=C["text_muted"])
+    )
+
+    if ev.get("mail_summary"):
+        controls.append(
+            ft.Text(ev["mail_summary"], size=11, color=C["text_sec"],
+                    max_lines=2, overflow=ft.TextOverflow.ELLIPSIS)
+        )
+
+    # 選考系かつ企業が紐付く場合のみ「詳細を見る」ボタンを表示
+    company_id = ev.get("company_id")
+    if company_id and classify_event(et) == "selection":
+        controls.append(ft.Container(height=6))
+        controls.append(
+            ft.Container(
+                content=ft.Row(
+                    spacing=4, tight=True,
+                    controls=[
+                        ft.Text(f"{co}の詳細を見る", size=11,
+                                weight=ft.FontWeight.W_600, color=C["accent"]),
+                        ft.Icon(ft.Icons.ARROW_FORWARD_ROUNDED, size=12, color=C["accent"]),
+                    ],
+                ),
+                on_click=lambda e, cid=company_id: on_open_detail(cid),
+                padding=pad_sym(h=2, v=2),
+            )
+        )
+
+    return ft.Container(
+        width=260,
+        bgcolor=C["surface"],
+        border_radius=12,
+        border=border_all(1, C["border"]),
+        padding=pad_all(14),
+        shadow=ft.BoxShadow(
+            blur_radius=24, spread_radius=0,
+            color="#00000022", offset=ft.Offset(0, 6),
+        ),
+        content=ft.Column(spacing=6, tight=True, controls=controls),
+    )
+
+
+# ─────────────────────────────────────────────
+# カレンダー：月ビュー
+# ─────────────────────────────────────────────
+
+def build_month_view(year: int, month: int,
+                     on_event_click, on_day_click) -> ft.Container:
+    """
+    Googleカレンダー風の月間グリッドを返す。
+    各マス目に当日のイベントチップを最大2件（＋もっと見る）表示する。
+    """
+    import calendar as _cal
+
+    today       = datetime.now()
+    first_wd    = _cal.weekday(year, month, 1)   # 0=月曜
+    total_days  = _cal.monthrange(year, month)[1]
+    # DBから当月イベントを取得
+    events      = db.get_events_for_month(year, month)
+
+    # 日付ごとにイベントをまとめる
+    day_events: dict[int, list] = {}
+    for ev in events:
+        try:
+            d = datetime.fromisoformat(ev["start_datetime"]).day
+            day_events.setdefault(d, []).append(ev)
+        except Exception:
+            pass
+
+    WEEKDAY_LABELS = ["月", "火", "水", "木", "金", "土", "日"]
+
+    # ── 曜日ヘッダー ──
+    wd_row = ft.Row(
+        spacing=0,
+        controls=[
+            ft.Container(
+                expand=1,
+                content=ft.Text(
+                    lbl, size=11, weight=ft.FontWeight.W_600,
+                    color=C["red"] if lbl == "日" else
+                          C["blue"] if lbl == "土" else C["text_muted"],
+                    text_align=ft.TextAlign.CENTER,
+                ),
+                padding=pad_sym(v=6),
+            )
+            for lbl in WEEKDAY_LABELS
+        ],
+    )
+
+    # ── 日付グリッド ──
+    cells = []
+    # 先月の空白セル
+    for _ in range(first_wd):
+        cells.append(ft.Container(expand=1, height=100))
+
+    for day in range(1, total_days + 1):
+        is_today = (year == today.year and month == today.month and day == today.day)
+        evs      = day_events.get(day, [])
+
+        # 日付数字
+        day_num = ft.Container(
+            content=ft.Text(
+                str(day), size=12,
+                weight=ft.FontWeight.W_700 if is_today else ft.FontWeight.W_400,
+                color=C["surface"] if is_today else C["text_primary"],
+                text_align=ft.TextAlign.CENTER,
+            ),
+            width=24, height=24,
+            bgcolor=C["accent"] if is_today else "transparent",
+            border_radius=12,
+            alignment=ft.alignment.center,
+            margin=mar(bottom=3),
+        )
+
+        # イベントチップ（最大2件）
+        chip_controls = [day_num]
+        for ev in evs[:2]:
+            fg, bg = cal_event_color(ev.get("event_type", ""))
+            label  = ev.get("event_type", "")[:8]
+            if ev.get("company_name"):
+                label = ev["company_name"][:6]
+            chip_controls.append(
+                ft.Container(
+                    content=ft.Text(label, size=9, color=fg,
+                                    weight=ft.FontWeight.W_600,
+                                    overflow=ft.TextOverflow.ELLIPSIS, max_lines=1),
+                    bgcolor=bg,
+                    border_radius=3,
+                    padding=pad_sym(h=4, v=2),
+                    margin=mar(bottom=2),
+                    on_click=lambda e, ev=ev: on_event_click(ev),
+                )
+            )
+        if len(evs) > 2:
+            chip_controls.append(
+                ft.Text(f"+{len(evs)-2}件", size=9, color=C["text_muted"])
+            )
+
+        cell = ft.Container(
+            expand=1,
+            height=100,
+            bgcolor=C["surface"],
+            border=border_only(
+                left=ft.BorderSide(1, C["border"]),
+                top=ft.BorderSide(1, C["border"]),
+            ),
+            padding=pad(left=4, top=4, right=2, bottom=2),
+            content=ft.Column(
+                spacing=0, controls=chip_controls,
+                scroll=ft.ScrollMode.AUTO,
+            ),
+            on_click=lambda e, d=day: on_day_click(year, month, d),
+        )
+        cells.append(cell)
+
+    # 末尾の空白セル（7の倍数になるよう）
+    remainder = len(cells) % 7
+    if remainder != 0:
+        for _ in range(7 - remainder):
+            cells.append(ft.Container(
+                expand=1, height=100,
+                bgcolor=C["surface"],
+                border=border_only(
+                    left=ft.BorderSide(1, C["border"]),
+                    top=ft.BorderSide(1, C["border"]),
+                ),
+            ))
+
+    # 行に分割
+    rows = []
+    for i in range(0, len(cells), 7):
+        week_cells = cells[i:i+7]
+        # 最後の列に右ボーダーを追加
+        for idx, cell in enumerate(week_cells):
+            if idx == 6 and cell.border:
+                cell.border = ft.Border(
+                    left=ft.BorderSide(1, C["border"]),
+                    top=ft.BorderSide(1, C["border"]),
+                    right=ft.BorderSide(1, C["border"]),
+                )
+        rows.append(ft.Row(controls=week_cells, spacing=0, expand=False))
+
+    # 最下行に bottom ボーダーを付与
+    if rows:
+        for cell in rows[-1].controls:
+            existing = cell.border
+            cell.border = ft.Border(
+                left=existing.left if existing else ft.BorderSide(1, C["border"]),
+                top=existing.top  if existing else ft.BorderSide(1, C["border"]),
+                right=existing.right if existing else ft.BorderSide(0, "transparent"),
+                bottom=ft.BorderSide(1, C["border"]),
+            )
+        # 最右下セルのみ right+bottom
+        last_cell = rows[-1].controls[-1]
+        last_cell.border = ft.Border(
+            left=ft.BorderSide(1, C["border"]),
+            top=ft.BorderSide(1, C["border"]),
+            right=ft.BorderSide(1, C["border"]),
+            bottom=ft.BorderSide(1, C["border"]),
+        )
+
+    return ft.Container(
+        bgcolor=C["surface"],
+        content=ft.Column(
+            spacing=0,
+            controls=[wd_row] + rows,
+        ),
+    )
+
+
+# ─────────────────────────────────────────────
+# カレンダー：週ビュー
+# ─────────────────────────────────────────────
+
+def build_week_view(year: int, month: int, day: int,
+                    on_event_click) -> ft.Container:
+    """
+    指定日を含む週（月〜日）の縦タイムライン形式ビュー。
+    """
+    from datetime import date, timedelta
+    import calendar as _cal
+
+    d          = date(year, month, day)
+    week_start = d - timedelta(days=d.weekday())
+    week_days  = [week_start + timedelta(days=i) for i in range(7)]
+    events     = db.get_events_for_week(year, month, day)
+    today      = datetime.now().date()
+
+    # 日付ごとにイベントを整理
+    day_map: dict[date, list] = {}
+    for ev in events:
+        try:
+            ev_date = datetime.fromisoformat(ev["start_datetime"]).date()
+            day_map.setdefault(ev_date, []).append(ev)
+        except Exception:
+            pass
+
+    WEEKDAY_JP = ["月", "火", "水", "木", "金", "土", "日"]
+
+    col_controls = []
+    for i, wd in enumerate(week_days):
+        is_today    = wd == today
+        wd_label    = WEEKDAY_JP[i]
+        day_evs     = day_map.get(wd, [])
+
+        day_header = ft.Container(
+            bgcolor=C["accent"] if is_today else C["surface2"],
+            border_radius=8,
+            padding=pad_sym(h=8, v=6),
+            margin=mar(bottom=6),
+            content=ft.Column(
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=1,
+                controls=[
+                    ft.Text(wd_label, size=10,
+                            color=C["surface"] if is_today else C["text_muted"]),
+                    ft.Text(str(wd.day), size=16,
+                            weight=ft.FontWeight.W_700,
+                            color=C["surface"] if is_today else C["text_primary"]),
+                ],
+            ),
+        )
+
+        ev_chips = [day_header]
+        for ev in day_evs:
+            fg, bg = cal_event_color(ev.get("event_type", ""))
+            co     = ev.get("company_name", "")[:6] or ev.get("event_type", "")[:6]
+            time_s = ""
+            try:
+                time_s = datetime.fromisoformat(ev["start_datetime"]).strftime("%H:%M")
+            except Exception:
+                pass
+            ev_chips.append(
+                ft.Container(
+                    content=ft.Column(
+                        spacing=1,
+                        controls=[
+                            ft.Text(co, size=10, color=fg,
+                                    weight=ft.FontWeight.W_600,
+                                    overflow=ft.TextOverflow.ELLIPSIS, max_lines=1),
+                            ft.Text(time_s, size=9, color=C["text_muted"]),
+                        ],
+                    ),
+                    bgcolor=bg,
+                    border_radius=5,
+                    padding=pad_sym(h=6, v=4),
+                    margin=mar(bottom=3),
+                    on_click=lambda e, ev=ev: on_event_click(ev),
+                )
+            )
+
+        col_controls.append(
+            ft.Container(
+                expand=1,
+                border=border_only(left=ft.BorderSide(1, C["border"])),
+                padding=pad_all(6),
+                content=ft.Column(
+                    spacing=0,
+                    controls=ev_chips,
+                    scroll=ft.ScrollMode.AUTO,
+                ),
+            )
+        )
+
+    return ft.Container(
+        bgcolor=C["surface"],
+        content=ft.Row(
+            spacing=0,
+            controls=col_controls,
+            vertical_alignment=ft.CrossAxisAlignment.START,
+        ),
+        border=border_only(
+            top=ft.BorderSide(1, C["border"]),
+            right=ft.BorderSide(1, C["border"]),
+            bottom=ft.BorderSide(1, C["border"]),
+        ),
+    )
+
+
+# ─────────────────────────────────────────────
+# カレンダー：日ビュー
+# ─────────────────────────────────────────────
+
+def build_day_view(year: int, month: int, day: int,
+                   on_event_click) -> ft.Container:
+    """
+    指定日のイベントを時系列リストで表示する。
+    """
+    events = db.get_events_for_day(year, month, day)
+
+    if not events:
+        return ft.Container(
+            bgcolor=C["surface"],
+            border=border_all(1, C["border"]),
+            border_radius=8,
+            padding=pad_all(20),
+            content=ft.Text("この日の予定はありません", size=13, color=C["text_muted"]),
+        )
+
+    rows = []
+    for ev in events:
+        fg, bg = cal_event_color(ev.get("event_type", ""))
+        co     = ev.get("company_name") or ""
+        et     = ev.get("event_type", "")
+        try:
+            start_t = datetime.fromisoformat(ev["start_datetime"]).strftime("%H:%M")
+        except Exception:
+            start_t = "—"
+        try:
+            end_t   = datetime.fromisoformat(ev["end_datetime"]).strftime("%H:%M") if ev.get("end_datetime") else ""
+        except Exception:
+            end_t = ""
+        time_str = start_t + (f" 〜 {end_t}" if end_t else "")
+
+        rows.append(
+            ft.Container(
+                content=ft.Row(
+                    spacing=12,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    controls=[
+                        ft.Text(time_str, size=12, color=C["text_sec"], width=100),
+                        ft.Container(
+                            content=ft.Text(et[:10], size=11,
+                                            weight=ft.FontWeight.W_600, color=fg),
+                            bgcolor=bg, border_radius=6, padding=pad_sym(h=8, v=4),
+                        ),
+                        ft.Text(co, size=12, color=C["text_primary"],
+                                expand=True, max_lines=1,
+                                overflow=ft.TextOverflow.ELLIPSIS),
+                    ],
+                ),
+                bgcolor=C["surface"],
+                border=border_all(1, C["border"]),
+                border_radius=8,
+                padding=pad_sym(h=14, v=10),
+                margin=mar(bottom=6),
+                on_click=lambda e, ev=ev: on_event_click(ev),
+            )
+        )
+
+    return ft.Container(
+        bgcolor="transparent",
+        content=ft.Column(spacing=0, controls=rows),
+    )
+
+
+# ─────────────────────────────────────────────
+# カレンダー：手動イベント追加ダイアログ
+# ─────────────────────────────────────────────
+
+def build_add_event_dialog(page, on_save):
+    """カレンダーからイベントを手動追加するダイアログ。DB + Google Calendar 両方に書き込む。"""
+    co_field = ft.TextField(
+        label="企業名（任意）", hint_text="例: 株式会社〇〇",
+        border_color=C["border_dark"], focused_border_color=C["accent"],
+        color=C["text_primary"], bgcolor=C["surface2"], text_size=12,
+        border_radius=8, content_padding=pad_sym(h=12, v=10),
+        label_style=ft.TextStyle(color=C["text_sec"], size=11),
+    )
+    title_field = ft.TextField(
+        label="イベント種別 *", hint_text="例: 1次面接、説明会",
+        border_color=C["border_dark"], focused_border_color=C["accent"],
+        color=C["text_primary"], bgcolor=C["surface2"], text_size=12,
+        border_radius=8, content_padding=pad_sym(h=12, v=10),
+        label_style=ft.TextStyle(color=C["text_sec"], size=11),
+    )
+    start_field = ft.TextField(
+        label="開始日時 *", hint_text="例: 2026-06-15T14:00:00",
+        border_color=C["border_dark"], focused_border_color=C["accent"],
+        color=C["text_primary"], bgcolor=C["surface2"], text_size=12,
+        border_radius=8, content_padding=pad_sym(h=12, v=10),
+        label_style=ft.TextStyle(color=C["text_sec"], size=11),
+    )
+    end_field = ft.TextField(
+        label="終了日時（任意）", hint_text="例: 2026-06-15T15:00:00",
+        border_color=C["border_dark"], focused_border_color=C["accent"],
+        color=C["text_primary"], bgcolor=C["surface2"], text_size=12,
+        border_radius=8, content_padding=pad_sym(h=12, v=10),
+        label_style=ft.TextStyle(color=C["text_sec"], size=11),
+    )
+    error_text = ft.Text("", color=C["red"], size=11)
+
+    def handle_save(e):
+        title = title_field.value.strip()
+        start = start_field.value.strip()
+        if not title:
+            error_text.value = "イベント種別を入力してください。"
+            error_text.update(); return
+        if not start:
+            error_text.value = "開始日時を入力してください。"
+            error_text.update(); return
+        try:
+            datetime.fromisoformat(start)
+        except ValueError:
+            error_text.value = "開始日時の形式が不正です（例: 2026-06-15T14:00:00）"
+            error_text.update(); return
+
+        end = end_field.value.strip() or None
+        if end:
+            try:
+                datetime.fromisoformat(end)
+            except ValueError:
+                error_text.value = "終了日時の形式が不正です。"
+                error_text.update(); return
+
+        on_save(co_field.value.strip() or None, title, start, end)
+        dlg.open = False
+        page.update()
+
+    def handle_cancel(e):
+        dlg.open = False
+        page.update()
+
+    dlg = ft.AlertDialog(
+        modal=True,
+        title=ft.Text("予定を追加", size=15, weight=ft.FontWeight.W_700,
+                      color=C["text_primary"]),
+        content=ft.Container(
+            width=360,
+            content=ft.Column(
+                tight=True, spacing=10,
+                controls=[co_field, title_field, start_field, end_field, error_text],
+            ),
+        ),
+        actions=[
+            ft.TextButton("キャンセル", on_click=handle_cancel,
+                          style=ft.ButtonStyle(color=C["text_sec"])),
+            ft.FilledButton(
+                "追加", on_click=handle_save,
+                style=ft.ButtonStyle(
+                    bgcolor=C["accent"], color=C["surface"],
+                    shape=ft.RoundedRectangleBorder(radius=8),
+                ),
+            ),
+        ],
+        bgcolor=C["surface"],
+    )
+    page.overlay.append(dlg)
+    dlg.open = True
+    page.update()
+
+
+# ─────────────────────────────────────────────
+# カレンダー：メインパネル
+# ─────────────────────────────────────────────
+
+def build_calendar_panel(page, on_open_company_detail) -> ft.Container:
+    """
+    月/週/日タブ切り替え対応カレンダーパネルを返す。
+    - 月ビュー：Googleカレンダー風7×6グリッド
+    - 週ビュー：月〜日の縦カラム
+    - 日ビュー：時系列リスト
+    - イベントクリック：選考系→右ペイン / 説明会系→吹き出しポップアップ
+    - 「予定追加」ボタン：DB + Google Calendar 双方向書き込み
+    """
+    today = datetime.now()
+    cur_year:  list = [today.year]
+    cur_month: list = [today.month]
+    cur_day:   list = [today.day]
+    cur_tab:   list = ["month"]   # "month" | "week" | "day"
+
+    # ポップアップ管理
+    popup_overlay: list = [None]
+
+    cal_body_ref: list = [None]   # ft.Container（中身を差し替える）
+
+    # ── ポップアップ閉じる ──
+    def close_popup():
+        if popup_overlay[0] and popup_overlay[0] in page.overlay:
+            page.overlay.remove(popup_overlay[0])
+            popup_overlay[0] = None
+        page.update()
+
+    # ── イベントクリック処理 ──
+    def on_event_click(ev):
+        close_popup()
+        kind = classify_event(ev.get("event_type", ""))
+        company_id = ev.get("company_id")
+
+        # 選考系で企業が紐付く → 右ペインを開く
+        if kind == "selection" and company_id:
+            on_open_company_detail(company_id)
+            return
+
+        # 単発系（または企業なし）→ ポップアップ
+        popup = build_cal_popup(
+            ev,
+            on_open_detail=lambda cid: on_open_company_detail(cid),
+            on_close_popup=close_popup,
+            page=page,
+        )
+        # Stack でオーバーレイ表示
+        popup_wrapper = ft.Container(
+            content=popup,
+            left=60, top=60,   # Stack 内での仮位置（後述で補正）
+        )
+        stack_overlay = ft.Stack(
+            controls=[
+                # 背景タップで閉じる透明レイヤー
+                ft.Container(
+                    expand=True,
+                    bgcolor="transparent",
+                    on_click=lambda e: close_popup(),
+                ),
+                popup_wrapper,
+            ],
+            expand=True,
+        )
+        popup_overlay[0] = stack_overlay
+        page.overlay.append(stack_overlay)
+        page.update()
+
+    # ── 日付クリック（月ビューのマス目クリック） → 日ビューへ ──
+    def on_day_click(y, m, d):
+        cur_year[0]  = y
+        cur_month[0] = m
+        cur_day[0]   = d
+        cur_tab[0]   = "day"
+        rebuild_calendar()
+
+    # ── カレンダー本体を再描画 ──
+    def rebuild_calendar():
+        tab = cur_tab[0]
+        y, m, d = cur_year[0], cur_month[0], cur_day[0]
+        if tab == "month":
+            body = build_month_view(y, m, on_event_click, on_day_click)
+        elif tab == "week":
+            body = build_week_view(y, m, d, on_event_click)
+        else:
+            body = build_day_view(y, m, d, on_event_click)
+
+        cal_body_ref[0].content = ft.ListView(
+            expand=True,
+            controls=[body],
+            padding=pad_all(0),
+        )
+        _update_nav_label()
+        cal_body_ref[0].update()
+        nav_label_ref[0].update()
+        tab_row_ref[0].controls = build_tab_controls()
+        tab_row_ref[0].update()
+
+    # ── ナビゲーションラベル ──
+    def nav_label_str():
+        import calendar as _cal
+        y, m, d = cur_year[0], cur_month[0], cur_day[0]
+        tab = cur_tab[0]
+        if tab == "month":
+            return f"{y}年 {m}月"
+        if tab == "week":
+            from datetime import date, timedelta
+            wd = date(y, m, d)
+            ws = wd - timedelta(days=wd.weekday())
+            we = ws + timedelta(days=6)
+            return f"{ws.strftime('%m/%d')} 〜 {we.strftime('%m/%d')}"
+        return f"{y}年{m}月{d}日"
+
+    nav_label_ref: list = [None]
+
+    def _update_nav_label():
+        if nav_label_ref[0]:
+            nav_label_ref[0].value = nav_label_str()
+
+    # ── 前へ / 次へ ──
+    def go_prev(e):
+        close_popup()
+        tab = cur_tab[0]
+        if tab == "month":
+            if cur_month[0] == 1:
+                cur_year[0]  -= 1
+                cur_month[0]  = 12
+            else:
+                cur_month[0] -= 1
+        elif tab == "week":
+            from datetime import date, timedelta
+            d = date(cur_year[0], cur_month[0], cur_day[0]) - timedelta(weeks=1)
+            cur_year[0], cur_month[0], cur_day[0] = d.year, d.month, d.day
+        else:
+            from datetime import date, timedelta
+            d = date(cur_year[0], cur_month[0], cur_day[0]) - timedelta(days=1)
+            cur_year[0], cur_month[0], cur_day[0] = d.year, d.month, d.day
+        rebuild_calendar()
+
+    def go_next(e):
+        close_popup()
+        tab = cur_tab[0]
+        if tab == "month":
+            if cur_month[0] == 12:
+                cur_year[0]  += 1
+                cur_month[0]  = 1
+            else:
+                cur_month[0] += 1
+        elif tab == "week":
+            from datetime import date, timedelta
+            d = date(cur_year[0], cur_month[0], cur_day[0]) + timedelta(weeks=1)
+            cur_year[0], cur_month[0], cur_day[0] = d.year, d.month, d.day
+        else:
+            from datetime import date, timedelta
+            d = date(cur_year[0], cur_month[0], cur_day[0]) + timedelta(days=1)
+            cur_year[0], cur_month[0], cur_day[0] = d.year, d.month, d.day
+        rebuild_calendar()
+
+    def go_today(e):
+        close_popup()
+        t = datetime.now()
+        cur_year[0], cur_month[0], cur_day[0] = t.year, t.month, t.day
+        rebuild_calendar()
+
+    # ── タブ切り替え ──
+    tab_row_ref: list = [None]
+
+    def switch_tab(key):
+        close_popup()
+        cur_tab[0] = key
+        rebuild_calendar()
+
+    def build_tab_controls():
+        tabs = [("month", "月"), ("week", "週"), ("day", "日")]
+        return [
+            ft.Container(
+                content=ft.Text(
+                    lbl, size=11,
+                    weight=ft.FontWeight.W_600 if cur_tab[0] == k else ft.FontWeight.W_400,
+                    color=C["accent"] if cur_tab[0] == k else C["text_muted"],
+                ),
+                bgcolor=C["accent_light"] if cur_tab[0] == k else "transparent",
+                border_radius=6,
+                padding=pad_sym(h=12, v=5),
+                on_click=lambda e, key=k: switch_tab(key),
+                animate=ft.Animation(150, ft.AnimationCurve.EASE_OUT),
+            )
+            for k, lbl in tabs
+        ]
+
+    # ── 予定追加ボタン処理 ──
+    def handle_add_event(company_name, event_type, start_iso, end_iso):
+        """DB保存 → Google Calendar 書き込み → カレンダー再描画"""
+        company_id = None
+        if company_name:
+            company_id = db.upsert_company(company_name)
+        db.insert_event(
+            company_id=company_id,
+            event_type=event_type,
+            start_datetime=start_iso,
+            end_datetime=end_iso,
+        )
+        # Google Calendar にも書き込み
+        co_label = company_name or "就活"
+        threading.Thread(
+            target=gcal_create_event,
+            args=(event_type, co_label, start_iso, end_iso or start_iso),
+            daemon=True,
+        ).start()
+        show_snack(page, "✅ 予定を追加しました", color="white", bg=C["green"])
+        rebuild_calendar()
+
+    # ── カレンダーヘッダー ──
+    nav_label = ft.Text(
+        nav_label_str(), size=15,
+        weight=ft.FontWeight.W_700, color=C["text_primary"],
+    )
+    nav_label_ref[0] = nav_label
+
+    tab_row = ft.Row(spacing=2, controls=build_tab_controls())
+    tab_row_ref[0] = tab_row
+
+    cal_header = ft.Container(
+        bgcolor=C["surface"],
+        border=border_only(bottom=ft.BorderSide(1, C["border"])),
+        padding=pad(left=16, top=12, right=16, bottom=10),
+        content=ft.Row(
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            controls=[
+                # 前へ
+                ft.IconButton(
+                    icon=ft.Icons.CHEVRON_LEFT_ROUNDED,
+                    icon_color=C["text_muted"], icon_size=20,
+                    on_click=go_prev,
+                ),
+                nav_label,
+                # 次へ
+                ft.IconButton(
+                    icon=ft.Icons.CHEVRON_RIGHT_ROUNDED,
+                    icon_color=C["text_muted"], icon_size=20,
+                    on_click=go_next,
+                ),
+                # 今日ボタン
+                ft.Container(
+                    content=ft.Text("今日", size=11,
+                                    weight=ft.FontWeight.W_600, color=C["accent"]),
+                    bgcolor=C["accent_light"],
+                    border_radius=6,
+                    padding=pad_sym(h=10, v=4),
+                    margin=mar(left=6),
+                    on_click=go_today,
+                ),
+                ft.Container(expand=True),
+                # 月/週/日 タブ
+                tab_row,
+                ft.Container(width=12),
+                # 予定追加ボタン
+                ft.FilledButton(
+                    content=ft.Row(
+                        spacing=4, tight=True,
+                        controls=[
+                            ft.Icon(ft.Icons.ADD_ROUNDED, size=14, color=C["surface"]),
+                            ft.Text("予定追加", size=11,
+                                    weight=ft.FontWeight.W_600, color=C["surface"]),
+                        ],
+                    ),
+                    on_click=lambda e: build_add_event_dialog(page, handle_add_event),
+                    style=ft.ButtonStyle(
+                        bgcolor=C["accent"],
+                        shape=ft.RoundedRectangleBorder(radius=8),
+                        padding=pad_sym(h=12, v=8),
+                    ),
+                ),
+            ],
+        ),
+    )
+
+    # ── カレンダー本体コンテナ（中身を差し替える） ──
+    cal_body = ft.Container(
+        expand=True,
+        bgcolor=C["surface"],
+        content=ft.ListView(
+            expand=True,
+            controls=[build_month_view(
+                cur_year[0], cur_month[0], on_event_click, on_day_click
+            )],
+            padding=pad_all(0),
+        ),
+    )
+    cal_body_ref[0] = cal_body
+
+    # ── 凡例 ──
+    legend = ft.Container(
+        bgcolor=C["surface"],
+        border=border_only(top=ft.BorderSide(1, C["border"])),
+        padding=pad_sym(h=16, v=8),
+        content=ft.Row(
+            spacing=16,
+            controls=[
+                ft.Row(spacing=4, controls=[
+                    ft.Container(width=10, height=10, bgcolor=C["blue"], border_radius=5),
+                    ft.Text("選考系（面接・GD等）", size=10, color=C["text_muted"]),
+                ]),
+                ft.Row(spacing=4, controls=[
+                    ft.Container(width=10, height=10, bgcolor=C["orange"], border_radius=5),
+                    ft.Text("説明会・セミナー系", size=10, color=C["text_muted"]),
+                ]),
+                ft.Row(spacing=4, controls=[
+                    ft.Container(width=10, height=10, bgcolor=C["red"], border_radius=5),
+                    ft.Text("締切・提出物", size=10, color=C["text_muted"]),
+                ]),
+            ],
+        ),
+    )
+
+    return ft.Container(
+        bgcolor=C["surface"],
+        border_radius=12,
+        border=border_all(1, C["border"]),
+        shadow=ft.BoxShadow(blur_radius=8, spread_radius=0,
+                            color="#00000010", offset=ft.Offset(0, 2)),
+        margin=mar(top=12),
+        content=ft.Column(
+            spacing=0,
+            controls=[cal_header, cal_body, legend],
+        ),
+    )
+
+
+# ─────────────────────────────────────────────
 # メインアプリ
 # ─────────────────────────────────────────────
 
@@ -1078,6 +2050,15 @@ def main(page: ft.Page):
         _render_detail(company)
         detail_wrapper.width = 380
         page.update()
+
+    def on_open_company_detail(company_id: int):
+        """カレンダーのイベントクリックから企業詳細ペインを開く。"""
+        co = db.get_company(company_id)
+        if co:
+            selected_id[0] = company_id
+            _render_detail(co)
+            detail_wrapper.width = 380
+            page.update()
 
     def _render_detail(company):
         detail_inner.content = build_detail_panel(
@@ -1256,6 +2237,9 @@ def main(page: ft.Page):
     dashboard_panel = build_dashboard_panel(page, on_todo_check, on_add_todo)
     dashboard_ref[0] = dashboard_panel
 
+    # ── カレンダーパネル生成 ──
+    calendar_panel = build_calendar_panel(page, on_open_company_detail)
+
     # ── 全体レイアウト ──
     page.add(
         ft.Column(
@@ -1266,7 +2250,7 @@ def main(page: ft.Page):
                     expand=True, spacing=0,
                     vertical_alignment=ft.CrossAxisAlignment.STRETCH,
                     controls=[
-                        # 左：メインエリア（ダッシュボード＋カンバン）
+                        # 左：メインエリア（ダッシュボード＋カンバン＋カレンダー）
                         ft.Container(
                             expand=True,
                             bgcolor=C["bg"],
@@ -1275,11 +2259,22 @@ def main(page: ft.Page):
                                 controls=[
                                     # 上段ダッシュボード
                                     dashboard_panel,
-                                    # カンバン
+                                    # カンバン＋カレンダー（スクロール可能）
                                     ft.Container(
                                         expand=True,
-                                        padding=pad(left=16, top=8, right=16, bottom=16),
-                                        content=kanban,
+                                        content=ft.ListView(
+                                            expand=True,
+                                            padding=pad(left=16, top=8, right=16, bottom=24),
+                                            controls=[
+                                                # カンバン（固定高さで表示）
+                                                ft.Container(
+                                                    height=460,
+                                                    content=kanban,
+                                                ),
+                                                # カレンダー（スクロールで出現）
+                                                calendar_panel,
+                                            ],
+                                        ),
                                     ),
                                 ],
                             ),

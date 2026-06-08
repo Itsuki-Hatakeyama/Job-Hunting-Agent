@@ -1280,7 +1280,7 @@ def build_month_view(year: int, month: int,
             width=24, height=24,
             bgcolor=C["accent"] if is_today else "transparent",
             border_radius=12,
-            alignment=ft.alignment.center,
+            alignment=ft.Alignment(0, 0),
             margin=mar(bottom=3),
         )
 

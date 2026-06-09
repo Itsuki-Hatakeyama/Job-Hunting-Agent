@@ -1220,6 +1220,7 @@ def build_month_view(year: int, month: int,
                      on_event_click, on_day_click) -> ft.Container:
     """
     Googleカレンダー風の月間グリッドを返す。
+    DBイベントと Google Calendar イベントをマージして表示する。
     各マス目に当日のイベントチップを最大2件（＋もっと見る）表示する。
     """
     import calendar as _cal
@@ -1227,12 +1228,58 @@ def build_month_view(year: int, month: int,
     today       = datetime.now()
     first_wd    = _cal.weekday(year, month, 1)   # 0=月曜
     total_days  = _cal.monthrange(year, month)[1]
-    # DBから当月イベントを取得
-    events      = db.get_events_for_month(year, month)
+
+    # ── DBから当月イベントを取得 ──
+    db_events = db.get_events_for_month(year, month)
+
+    # ── Google Calendar から当月イベントを取得してマージ ──
+    # gcal_fetch_month は token.json がなければ空リストを返すのでフォールバック安全
+    gcal_events_raw = gcal_fetch_month(year, month)
+
+    # DBイベントの gmail_msg_id / start_datetime セットを作成（重複排除用）
+    db_keys = set()
+    for ev in db_events:
+        try:
+            dt_str = datetime.fromisoformat(ev["start_datetime"]).strftime("%Y-%m-%d")
+            name   = (ev.get("company_name") or ev.get("event_type") or "")[:8]
+            db_keys.add(f"{dt_str}_{name}")
+        except Exception:
+            pass
+
+    # GCalのみに存在するイベントを補完イベントとして追加
+    merged_events = list(db_events)
+    for gcal_ev in gcal_events_raw:
+        try:
+            start_raw = gcal_ev.get("start_iso", "")
+            if not start_raw:
+                continue
+            dt_str = datetime.fromisoformat(start_raw).strftime("%Y-%m-%d")
+            title  = gcal_ev.get("title", "")
+            # タイトルから企業名っぽい部分を抽出 ([〇〇] 形式)
+            import re
+            m = re.search(r"\[(.+?)\]", title)
+            name = m.group(1)[:8] if m else title[:8]
+            key  = f"{dt_str}_{name}"
+            if key not in db_keys:
+                # GCalのみのイベントを表示用のdictとして追加
+                merged_events.append({
+                    "id":             None,
+                    "company_id":     None,
+                    "company_name":   name,
+                    "event_type":     title,
+                    "start_datetime": start_raw,
+                    "end_datetime":   gcal_ev.get("end_iso"),
+                    "is_completed":   0,
+                    "is_todo":        0,
+                    "mail_summary":   None,
+                    "source":         "gcal",   # GCal由来フラグ
+                })
+        except Exception:
+            pass
 
     # 日付ごとにイベントをまとめる
     day_events: dict[int, list] = {}
-    for ev in events:
+    for ev in merged_events:
         try:
             d = datetime.fromisoformat(ev["start_datetime"]).day
             day_events.setdefault(d, []).append(ev)
@@ -1291,6 +1338,8 @@ def build_month_view(year: int, month: int,
             label  = ev.get("event_type", "")[:8]
             if ev.get("company_name"):
                 label = ev["company_name"][:6]
+            # GCal由来イベントはボーダーで区別
+            is_gcal = ev.get("source") == "gcal"
             chip_controls.append(
                 ft.Container(
                     content=ft.Text(label, size=9, color=fg,
@@ -1298,6 +1347,7 @@ def build_month_view(year: int, month: int,
                                     overflow=ft.TextOverflow.ELLIPSIS, max_lines=1),
                     bgcolor=bg,
                     border_radius=3,
+                    border=border_all(1, fg) if is_gcal else None,
                     padding=pad_sym(h=4, v=2),
                     margin=mar(bottom=2),
                     on_click=lambda e, ev=ev: on_event_click(ev),
@@ -1965,6 +2015,13 @@ def build_calendar_panel(page, on_open_company_detail) -> ft.Container:
                     ft.Container(width=10, height=10, bgcolor=C["red"], border_radius=5),
                     ft.Text("締切・提出物", size=10, color=C["text_muted"]),
                 ]),
+                ft.Row(spacing=4, controls=[
+                    ft.Container(
+                        width=10, height=10, bgcolor=C["blue_light"],
+                        border_radius=5, border=border_all(1, C["blue"]),
+                    ),
+                    ft.Text("Googleカレンダー連携", size=10, color=C["text_muted"]),
+                ]),
             ],
         ),
     )
@@ -2061,6 +2118,12 @@ def main(page: ft.Page):
             co = db.get_company(selected_id[0])
             if co:
                 _render_detail(co)
+
+        # ── A-1修正：バッジのカード数を実際の件数に更新 ──
+        for lane in LANES:
+            if lane in lane_badge_texts:
+                lane_badge_texts[lane].value = str(len(lane_cols[lane].controls))
+
         page.update()
 
     def refresh_dashboard():
@@ -2241,6 +2304,9 @@ def main(page: ft.Page):
     )
 
     # ── カンバンレーン ──
+    # バッジテキストへの参照を保持（refresh_lanes から更新するため）
+    lane_badge_texts: dict[str, ft.Text] = {}
+
     def build_lane(lane_name):
         accent_col = C["lane_header"][lane_name]
         icon       = C["lane_icon"][lane_name]
@@ -2249,6 +2315,9 @@ def main(page: ft.Page):
             str(len(lane_cols[lane_name].controls)),
             size=11, weight=ft.FontWeight.W_700, color=accent_col,
         )
+        # 参照を辞書に保存
+        lane_badge_texts[lane_name] = count_text
+
         count_badge = ft.Container(
             content=count_text,
             bgcolor=C["surface2"], border_radius=10,

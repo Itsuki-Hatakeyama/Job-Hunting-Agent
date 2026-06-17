@@ -35,15 +35,43 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar.events",
 ]
 
-_SUBJECT_FILTER = (
-    "(subject:面接 OR subject:選考 OR subject:説明会 OR subject:インターン "
-    "OR subject:ES OR subject:締切 OR subject:マイページ OR subject:内定 "
-    "OR subject:エントリー OR subject:承諾 OR subject:採用)"
+# ─────────────────────────────────────────────
+# Gmail 検索クエリ
+# subject: を外すことで「件名 OR 本文」の両方を検索対象にする。
+# 就活専用アカウント前提で全キーワードを網羅する。
+# ─────────────────────────────────────────────
+
+_KEYWORD_FILTER = (
+    "("
+    # 選考プロセス系
+    "面接 OR 面談 OR 選考 OR 書類選考 OR 通過 OR 合否 OR "
+    # 結果系
+    "内定 OR 内々定 OR 不採用 OR お見送り OR 採用 OR 承諾 OR 辞退 OR "
+    # 説明会・イベント系
+    "説明会 OR セミナー OR 座談会 OR ガイダンス OR ワークショップ OR "
+    "OB訪問 OR OG訪問 OR グループディスカッション OR GD OR "
+    # テスト・書類系
+    "WEBテスト OR Webテスト OR SPI OR 適性検査 OR テストセンター OR "
+    "ES OR エントリーシート OR 履歴書 OR 職務経歴書 OR 書類 OR "
+    # その他就活キーワード
+    "インターン OR エントリー OR 締切 OR 期限 OR マイページ OR "
+    "就活 OR 就職 OR 採用担当 OR リクルーター OR オファー"
+    ")"
 )
-GMAIL_SEARCH_QUERY  = f"-label:就活-処理済み {_SUBJECT_FILTER}"
-GMAIL_INITIAL_QUERY = _SUBJECT_FILTER
+
+# 通常同期：未処理メールのみ（Agent ラベルが付いていないもの）
+GMAIL_SEARCH_QUERY  = f"-label:Agent {_KEYWORD_FILTER}"
+
+# 初回取込：既読・処理済み問わず全件
+GMAIL_INITIAL_QUERY = _KEYWORD_FILTER
+
+# ─────────────────────────────────────────────
+# メルマガ除外ドメイン
+# クエリで広く取った分をここで絞り込む。
+# ─────────────────────────────────────────────
 
 NEWSLETTER_DOMAINS = [
+    # 就活情報サービス（メルマガ）
     "onecareer.jp",
     "techoffer.jp",
     "offerbox.jp",
@@ -51,9 +79,33 @@ NEWSLETTER_DOMAINS = [
     "mynavi.jp",
     "jobrass.com",
     "dodaycareer.jp",
+    "vorkers.com",
+    "openwork.jp",
+    "en-japan.com",
+    "type.jp",
+    "doda.jp",
+    "dodax.jp",
+    "recruit.co.jp",
+    "intee.jp",
+    "labbase.jp",
+    "wantedly.com",
+    "gaishishukatsu.com",
+    "external-link.jp",         # リクナビ外部リンク
+    "mail.line.me",             # LINE就活
+    "job.nikkei.jp",            # 日経就職ナビ
+    "career.oricon.co.jp",      # オリコンキャリア
+    # EC・汎用通知（本文検索拡充で混入しやすいドメイン）
+    "amazon.co.jp",
+    "amazon.com",
+    "rakuten.co.jp",
+    "mercari.com",
+    "paypay.ne.jp",
+    "apple.com",
+    "google.com",
+    "noreply.github.com",
 ]
 
-PROCESSED_LABEL_NAME = "就活-処理済み"
+PROCESSED_LABEL_NAME = "Agent"
 
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL   = "gemma2:9b"

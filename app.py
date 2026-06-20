@@ -1843,47 +1843,20 @@ def build_calendar_panel(page, on_open_company_detail, detail_wrapper_ref: list)
     # ポップアップ管理
     popup_overlay: list = [None]
 
+    # カレンダーStack内にポップアップを表示するための参照
+    cal_stack_ref: list = [None]
+
     cal_body_ref: list = [None]   # ft.Container（中身を差し替える）
 
     # ── ポップアップ閉じる ──
     def close_popup():
-        if popup_overlay[0] and popup_overlay[0] in page.overlay:
-            page.overlay.remove(popup_overlay[0])
+        if popup_overlay[0] is not None and cal_stack_ref[0] is not None:
+            try:
+                cal_stack_ref[0].controls = [cal_stack_ref[0].controls[0]]
+                cal_stack_ref[0].update()
+            except Exception:
+                pass
             popup_overlay[0] = None
-        page.update()
-
-    def _calc_popup_pos(col: int, row: int) -> tuple[float, float]:
-        """
-        クリックされたセルの列・行番号から、ポップアップの left/top を計算する。
-        page.width をベースにリサイズ追従。画面端にはみ出さないよう補正する。
-        """
-        DETAIL_W   = 380 if detail_wrapper_ref[0] and detail_wrapper_ref[0].width > 0 else 0
-        PADDING    = 32   # 左右padding合計
-        HEADER_H   = 60   # ヘッダー高
-        DASH_H     = 196  # ダッシュボード高（開いている場合）
-        KANBAN_H   = 460  # カンバン高
-        CAL_HDR_H  = 52   # カレンダーヘッダー高
-        WD_ROW_H   = 32   # 曜日ヘッダー行高
-        CELL_H     = 120  # セル高（Issue6で変更済み）
-        POPUP_W    = 270
-        POPUP_H    = 200  # 概算
-
-        cal_w      = (page.width or 1500) - DETAIL_W - PADDING
-        cell_w     = cal_w / 7
-
-        # セル左上の絶対座標（スクロール量は無視、カレンダーエリア内の相対位置）
-        left_base  = PADDING / 2 + col * cell_w
-        top_base   = HEADER_H + DASH_H + KANBAN_H + CAL_HDR_H + WD_ROW_H + row * CELL_H + CELL_H
-
-        # 右端はみ出し補正
-        if left_base + POPUP_W > (page.width or 1500) - DETAIL_W - 10:
-            left_base = left_base - POPUP_W + cell_w
-
-        # 下端はみ出し補正
-        if top_base + POPUP_H > (page.height or 920) - 20:
-            top_base = top_base - POPUP_H - CELL_H
-
-        return max(left_base, 8), max(top_base, HEADER_H + 10)
 
     # ── イベントクリック処理 ──
     def on_event_click(ev, col: int = 3, row: int = 2):
@@ -1896,7 +1869,7 @@ def build_calendar_panel(page, on_open_company_detail, detail_wrapper_ref: list)
             on_open_company_detail(company_id)
             return
 
-        # 単発系（または企業なし）→ ポップアップ
+        # 単発系（または企業なし）→ カレンダー右上にポップアップ表示
         popup = build_cal_popup(
             ev,
             on_open_detail=lambda cid: on_open_company_detail(cid),
@@ -1904,27 +1877,26 @@ def build_calendar_panel(page, on_open_company_detail, detail_wrapper_ref: list)
             page=page,
         )
 
-        left, top = _calc_popup_pos(col, row)
-
-        popup_wrapper = ft.Container(
-            content=popup,
-            left=left,
-            top=top,
-        )
-        stack_overlay = ft.Stack(
-            controls=[
-                ft.Container(
-                    expand=True,
-                    bgcolor="transparent",
-                    on_click=lambda e: close_popup(),
-                ),
-                popup_wrapper,
-            ],
+        # 透明な背景レイヤー（外タップで閉じる）＋ポップアップ本体
+        overlay_layer = ft.Container(
             expand=True,
+            bgcolor="transparent",
+            on_click=lambda e: close_popup(),
         )
-        popup_overlay[0] = stack_overlay
-        page.overlay.append(stack_overlay)
-        page.update()
+        popup_container = ft.Container(
+            content=popup,
+            right=16,
+            top=56,   # カレンダーヘッダー直下の右上固定
+        )
+
+        popup_overlay[0] = popup_container
+        if cal_stack_ref[0] is not None:
+            cal_stack_ref[0].controls = [
+                cal_stack_ref[0].controls[0],  # カレンダー本体
+                overlay_layer,
+                popup_container,
+            ]
+            cal_stack_ref[0].update()
 
     # ── 日付クリック（月ビューのマス目クリック） → 日ビューへ ──
     def on_day_click(y, m, d):
@@ -2180,17 +2152,28 @@ def build_calendar_panel(page, on_open_company_detail, detail_wrapper_ref: list)
         ),
     )
 
+    # ── カレンダー全体をStackで包む（ポップアップを右上固定でオーバーレイ） ──
+    cal_stack = ft.Stack(
+        controls=[
+            ft.Container(
+                bgcolor=C["surface"],
+                border_radius=12,
+                border=border_all(1, C["border"]),
+                shadow=ft.BoxShadow(blur_radius=8, spread_radius=0,
+                                    color="#00000010", offset=ft.Offset(0, 2)),
+                content=ft.Column(
+                    spacing=0,
+                    controls=[cal_header, cal_body, legend],
+                ),
+            ),
+        ],
+        expand=True,
+    )
+    cal_stack_ref[0] = cal_stack
+
     return ft.Container(
-        bgcolor=C["surface"],
-        border_radius=12,
-        border=border_all(1, C["border"]),
-        shadow=ft.BoxShadow(blur_radius=8, spread_radius=0,
-                            color="#00000010", offset=ft.Offset(0, 2)),
         margin=mar(top=12),
-        content=ft.Column(
-            spacing=0,
-            controls=[cal_header, cal_body, legend],
-        ),
+        content=cal_stack,
     )
 
 

@@ -440,11 +440,23 @@ def save_email_event(
     )
 
     status_updated = False
+
+    # 1. 面接系 → 「結果待ち」に更新（既存ロジック）
     if any(kw in event_type for kw in INTERVIEW_KEYWORDS):
         current = get_company(company_id)
         if current and current["status"] not in ("結果", "お見送り"):
             update_company_status(company_id, "結果待ち")
             status_updated = True
+
+    # 2. お見送り通知 → 「お見送り」に更新（部分一致で表記ブレを吸収）
+    elif "お見送り通知" in event_type or "不採用" in event_type:
+        update_company_status(company_id, "お見送り")
+        status_updated = True
+
+    # 3. 内定通知 → 「結果」に更新（部分一致で表記ブレを吸収）
+    elif "内定通知" in event_type:
+        update_company_status(company_id, "結果")
+        status_updated = True
 
     return {
         "company_id": company_id,

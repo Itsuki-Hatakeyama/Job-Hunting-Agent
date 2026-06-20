@@ -1286,6 +1286,14 @@ def build_month_view(year: int, month: int,
         except Exception:
             pass
 
+    # 日付→列・行マップ（Issue4: ポップアップ座標計算用）
+    day_col_map: dict[int, int] = {}
+    day_row_map: dict[int, int] = {}
+    for day in range(1, total_days + 1):
+        cell_idx = first_wd + day - 1
+        day_col_map[day] = cell_idx % 7
+        day_row_map[day] = cell_idx // 7
+
     WEEKDAY_LABELS = ["月", "火", "水", "木", "金", "土", "日"]
 
     # ── 曜日ヘッダー ──
@@ -1310,7 +1318,7 @@ def build_month_view(year: int, month: int,
     cells = []
     # 先月の空白セル
     for _ in range(first_wd):
-        cells.append(ft.Container(expand=1, height=100))
+        cells.append(ft.Container(expand=1, height=120))
 
     for day in range(1, total_days + 1):
         is_today = (year == today.year and month == today.month and day == today.day)
@@ -1331,36 +1339,35 @@ def build_month_view(year: int, month: int,
             margin=mar(bottom=3),
         )
 
-        # イベントチップ（最大2件）
+        # イベントチップ（最大3件）Issue6: size=11, padding=4
         chip_controls = [day_num]
-        for ev in evs[:2]:
+        for ev in evs[:3]:
             fg, bg = cal_event_color(ev.get("event_type", ""))
-            label  = ev.get("event_type", "")[:8]
+            label  = ev.get("event_type", "")[:10]
             if ev.get("company_name"):
-                label = ev["company_name"][:6]
-            # GCal由来イベントはボーダーで区別
+                label = ev["company_name"][:8]
             is_gcal = ev.get("source") == "gcal"
             chip_controls.append(
                 ft.Container(
-                    content=ft.Text(label, size=9, color=fg,
+                    content=ft.Text(label, size=11, color=fg,
                                     weight=ft.FontWeight.W_600,
                                     overflow=ft.TextOverflow.ELLIPSIS, max_lines=1),
                     bgcolor=bg,
-                    border_radius=3,
+                    border_radius=4,
                     border=border_all(1, fg) if is_gcal else None,
-                    padding=pad_sym(h=4, v=2),
+                    padding=pad_sym(h=6, v=4),
                     margin=mar(bottom=2),
-                    on_click=lambda e, ev=ev: on_event_click(ev),
+                    on_click=lambda e, ev=ev: on_event_click(ev, col=day_col_map.get(day, 0), row=day_row_map.get(day, 0)),
                 )
             )
-        if len(evs) > 2:
+        if len(evs) > 3:
             chip_controls.append(
-                ft.Text(f"+{len(evs)-2}件", size=9, color=C["text_muted"])
+                ft.Text(f"+{len(evs)-3}件", size=10, color=C["text_muted"])
             )
 
         cell = ft.Container(
             expand=1,
-            height=100,
+            height=120,
             bgcolor=C["surface"],
             border=border_only(
                 left=ft.BorderSide(1, C["border"]),
@@ -1380,7 +1387,7 @@ def build_month_view(year: int, month: int,
     if remainder != 0:
         for _ in range(7 - remainder):
             cells.append(ft.Container(
-                expand=1, height=100,
+                expand=1, height=120,
                 bgcolor=C["surface"],
                 border=border_only(
                     left=ft.BorderSide(1, C["border"]),
@@ -1437,16 +1444,22 @@ def build_month_view(year: int, month: int,
 def build_week_view(year: int, month: int, day: int,
                     on_event_click) -> ft.Container:
     """
-    指定日を含む週（月〜日）の縦タイムライン形式ビュー。
+    指定日を含む週（月〜日）の24時間固定グリッドビュー。
+    予定の有無に関わらず0:00〜23:00の時間軸を常に表示する。
     """
     from datetime import date, timedelta
-    import calendar as _cal
+
+    HOUR_HEIGHT = 50   # 1時間あたりの高さ(px)
+    HOURS       = 24
+    TIME_COL_W  = 44   # 左の時刻ラベル列の幅
 
     d          = date(year, month, day)
     week_start = d - timedelta(days=d.weekday())
     week_days  = [week_start + timedelta(days=i) for i in range(7)]
     events     = db.get_events_for_week(year, month, day)
     today      = datetime.now().date()
+
+    WEEKDAY_JP = ["月", "火", "水", "木", "金", "土", "日"]
 
     # 日付ごとにイベントを整理
     day_map: dict[date, list] = {}
@@ -1457,84 +1470,137 @@ def build_week_view(year: int, month: int, day: int,
         except Exception:
             pass
 
-    WEEKDAY_JP = ["月", "火", "水", "木", "金", "土", "日"]
-
-    col_controls = []
+    # ── 曜日ヘッダー行 ──
+    header_cells = [ft.Container(width=TIME_COL_W)]  # 左端の空白
     for i, wd in enumerate(week_days):
-        is_today    = wd == today
-        wd_label    = WEEKDAY_JP[i]
-        day_evs     = day_map.get(wd, [])
-
-        day_header = ft.Container(
-            bgcolor=C["accent"] if is_today else C["surface2"],
-            border_radius=8,
-            padding=pad_sym(h=8, v=6),
-            margin=mar(bottom=6),
-            content=ft.Column(
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                spacing=1,
-                controls=[
-                    ft.Text(wd_label, size=10,
-                            color=C["surface"] if is_today else C["text_muted"]),
-                    ft.Text(str(wd.day), size=16,
-                            weight=ft.FontWeight.W_700,
-                            color=C["surface"] if is_today else C["text_primary"]),
-                ],
-            ),
-        )
-
-        ev_chips = [day_header]
-        for ev in day_evs:
-            fg, bg = cal_event_color(ev.get("event_type", ""))
-            co     = ev.get("company_name", "")[:6] or ev.get("event_type", "")[:6]
-            time_s = ""
-            try:
-                time_s = datetime.fromisoformat(ev["start_datetime"]).strftime("%H:%M")
-            except Exception:
-                pass
-            ev_chips.append(
-                ft.Container(
-                    content=ft.Column(
-                        spacing=1,
-                        controls=[
-                            ft.Text(co, size=10, color=fg,
-                                    weight=ft.FontWeight.W_600,
-                                    overflow=ft.TextOverflow.ELLIPSIS, max_lines=1),
-                            ft.Text(time_s, size=9, color=C["text_muted"]),
-                        ],
-                    ),
-                    bgcolor=bg,
-                    border_radius=5,
-                    padding=pad_sym(h=6, v=4),
-                    margin=mar(bottom=3),
-                    on_click=lambda e, ev=ev: on_event_click(ev),
-                )
-            )
-
-        col_controls.append(
+        is_today = wd == today
+        header_cells.append(
             ft.Container(
                 expand=1,
-                border=border_only(left=ft.BorderSide(1, C["border"])),
-                padding=pad_all(6),
+                bgcolor=C["accent"] if is_today else "transparent",
+                border_radius=6,
+                padding=pad_sym(v=4),
                 content=ft.Column(
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                     spacing=0,
-                    controls=ev_chips,
-                    scroll=ft.ScrollMode.AUTO,
+                    controls=[
+                        ft.Text(WEEKDAY_JP[i], size=10,
+                                color=C["surface"] if is_today else C["text_muted"]),
+                        ft.Text(str(wd.day), size=15,
+                                weight=ft.FontWeight.W_700,
+                                color=C["surface"] if is_today else C["text_primary"]),
+                    ],
                 ),
             )
         )
+    header_row = ft.Row(spacing=0, controls=header_cells)
+
+    # ── 時間グリッド ──
+    # 各列（曜日）のイベントを絶対座標でStackに重ねる
+    def make_day_col(wd: date) -> ft.Stack:
+        day_evs = day_map.get(wd, [])
+        # 背景グリッド（1時間ごとのボーダー）
+        grid_lines = []
+        for h in range(HOURS):
+            grid_lines.append(
+                ft.Container(
+                    height=HOUR_HEIGHT,
+                    border=border_only(
+                        top=ft.BorderSide(1, C["border"]),
+                        left=ft.BorderSide(1, C["border"]),
+                    ),
+                )
+            )
+        bg_col = ft.Column(spacing=0, controls=grid_lines)
+
+        # イベントブロックを絶対座標で配置
+        event_blocks = []
+        for ev in day_evs:
+            try:
+                start_dt = datetime.fromisoformat(ev["start_datetime"])
+                end_dt   = datetime.fromisoformat(ev["end_datetime"]) if ev.get("end_datetime") else start_dt.replace(hour=start_dt.hour+1)
+                top_px   = (start_dt.hour + start_dt.minute / 60) * HOUR_HEIGHT
+                height_px = max(((end_dt.hour + end_dt.minute / 60) - (start_dt.hour + start_dt.minute / 60)) * HOUR_HEIGHT, 20)
+                fg, bg = cal_event_color(ev.get("event_type", ""))
+                label  = ev.get("company_name", "")[:8] or ev.get("event_type", "")[:8]
+                time_s = start_dt.strftime("%H:%M")
+                event_blocks.append(
+                    ft.Container(
+                        top=top_px,
+                        left=2,
+                        right=2,
+                        height=height_px,
+                        bgcolor=bg,
+                        border_radius=4,
+                        border=border_all(1, fg),
+                        padding=pad_sym(h=4, v=2),
+                        content=ft.Column(
+                            spacing=0,
+                            controls=[
+                                ft.Text(time_s, size=9, color=fg),
+                                ft.Text(label, size=10, color=fg,
+                                        weight=ft.FontWeight.W_600,
+                                        overflow=ft.TextOverflow.ELLIPSIS,
+                                        max_lines=1),
+                            ],
+                        ),
+                        on_click=lambda e, ev=ev: on_event_click(ev),
+                    )
+                )
+            except Exception:
+                pass
+
+        return ft.Stack(
+            controls=[bg_col] + event_blocks,
+            height=HOUR_HEIGHT * HOURS,
+        )
+
+    # 時刻ラベル列
+    time_labels = []
+    for h in range(HOURS):
+        time_labels.append(
+            ft.Container(
+                height=HOUR_HEIGHT,
+                content=ft.Text(f"{h:02d}:00", size=9, color=C["text_muted"]),
+                padding=pad(right=4, top=2),
+                alignment=ft.Alignment(1, -1),
+            )
+        )
+    time_col = ft.Column(spacing=0, controls=time_labels)
+
+    # 全曜日列を横並び
+    day_cols = [ft.Container(expand=1, content=make_day_col(wd)) for wd in week_days]
+    grid_row = ft.Row(
+        spacing=0,
+        vertical_alignment=ft.CrossAxisAlignment.START,
+        controls=[
+            ft.Container(width=TIME_COL_W, content=time_col),
+            *day_cols,
+        ],
+    )
 
     return ft.Container(
         bgcolor=C["surface"],
-        content=ft.Row(
+        border=border_all(1, C["border"]),
+        border_radius=8,
+        content=ft.Column(
             spacing=0,
-            controls=col_controls,
-            vertical_alignment=ft.CrossAxisAlignment.START,
-        ),
-        border=border_only(
-            top=ft.BorderSide(1, C["border"]),
-            right=ft.BorderSide(1, C["border"]),
-            bottom=ft.BorderSide(1, C["border"]),
+            controls=[
+                # 曜日ヘッダー
+                ft.Container(
+                    border=border_only(bottom=ft.BorderSide(1, C["border"])),
+                    padding=pad_sym(h=4, v=6),
+                    content=header_row,
+                ),
+                # スクロール可能な時間グリッド
+                ft.Container(
+                    height=min(HOUR_HEIGHT * HOURS, 600),  # 最大600pxでスクロール
+                    content=ft.ListView(
+                        expand=True,
+                        controls=[grid_row],
+                    ),
+                ),
+            ],
         ),
     )
 
@@ -1546,63 +1612,122 @@ def build_week_view(year: int, month: int, day: int,
 def build_day_view(year: int, month: int, day: int,
                    on_event_click) -> ft.Container:
     """
-    指定日のイベントを時系列リストで表示する。
+    指定日の24時間固定グリッドビュー。
+    予定がない時間帯も空のグリッドとして表示する。
     """
-    events = db.get_events_for_day(year, month, day)
+    HOUR_HEIGHT = 50
+    HOURS       = 24
+    TIME_COL_W  = 44
 
-    if not events:
-        return ft.Container(
-            bgcolor=C["surface"],
-            border=border_all(1, C["border"]),
-            border_radius=8,
-            padding=pad_all(20),
-            content=ft.Text("この日の予定はありません", size=13, color=C["text_muted"]),
-        )
+    events   = db.get_events_for_day(year, month, day)
+    today    = datetime.now()
+    is_today = (year == today.year and month == today.month and day == today.day)
 
-    rows = []
-    for ev in events:
-        fg, bg = cal_event_color(ev.get("event_type", ""))
-        co     = ev.get("company_name") or ""
-        et     = ev.get("event_type", "")
-        try:
-            start_t = datetime.fromisoformat(ev["start_datetime"]).strftime("%H:%M")
-        except Exception:
-            start_t = "—"
-        try:
-            end_t   = datetime.fromisoformat(ev["end_datetime"]).strftime("%H:%M") if ev.get("end_datetime") else ""
-        except Exception:
-            end_t = ""
-        time_str = start_t + (f" 〜 {end_t}" if end_t else "")
-
-        rows.append(
+    # 背景グリッド
+    grid_lines = []
+    for h in range(HOURS):
+        grid_lines.append(
             ft.Container(
-                content=ft.Row(
-                    spacing=12,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    controls=[
-                        ft.Text(time_str, size=12, color=C["text_sec"], width=100),
-                        ft.Container(
-                            content=ft.Text(et[:10], size=11,
-                                            weight=ft.FontWeight.W_600, color=fg),
-                            bgcolor=bg, border_radius=6, padding=pad_sym(h=8, v=4),
-                        ),
-                        ft.Text(co, size=12, color=C["text_primary"],
-                                expand=True, max_lines=1,
-                                overflow=ft.TextOverflow.ELLIPSIS),
-                    ],
-                ),
-                bgcolor=C["surface"],
-                border=border_all(1, C["border"]),
-                border_radius=8,
-                padding=pad_sym(h=14, v=10),
-                margin=mar(bottom=6),
-                on_click=lambda e, ev=ev: on_event_click(ev),
+                height=HOUR_HEIGHT,
+                border=border_only(top=ft.BorderSide(1, C["border"])),
             )
         )
+    bg_col = ft.Column(spacing=0, controls=grid_lines)
+
+    # イベントブロック（絶対座標）
+    event_blocks = []
+    for ev in events:
+        try:
+            start_dt  = datetime.fromisoformat(ev["start_datetime"])
+            end_dt    = datetime.fromisoformat(ev["end_datetime"]) if ev.get("end_datetime") else start_dt.replace(hour=min(start_dt.hour+1, 23))
+            top_px    = (start_dt.hour + start_dt.minute / 60) * HOUR_HEIGHT
+            height_px = max(((end_dt.hour + end_dt.minute / 60) - (start_dt.hour + start_dt.minute / 60)) * HOUR_HEIGHT, 24)
+            fg, bg    = cal_event_color(ev.get("event_type", ""))
+            co        = ev.get("company_name", "")[:12] or ev.get("event_type", "")[:12]
+            et        = ev.get("event_type", "")[:12]
+            time_s    = f"{start_dt.strftime('%H:%M')} 〜 {end_dt.strftime('%H:%M')}"
+            event_blocks.append(
+                ft.Container(
+                    top=top_px,
+                    left=4,
+                    right=4,
+                    height=height_px,
+                    bgcolor=bg,
+                    border_radius=6,
+                    border=border_all(1.5, fg),
+                    padding=pad_sym(h=8, v=4),
+                    content=ft.Column(
+                        spacing=1,
+                        controls=[
+                            ft.Text(time_s, size=10, color=fg),
+                            ft.Text(co, size=12, color=fg,
+                                    weight=ft.FontWeight.W_700,
+                                    overflow=ft.TextOverflow.ELLIPSIS, max_lines=1),
+                            ft.Text(et, size=10, color=fg,
+                                    overflow=ft.TextOverflow.ELLIPSIS, max_lines=1),
+                        ],
+                    ),
+                    on_click=lambda e, ev=ev: on_event_click(ev),
+                )
+            )
+        except Exception:
+            pass
+
+    # 時刻ラベル列
+    time_labels = []
+    for h in range(HOURS):
+        time_labels.append(
+            ft.Container(
+                height=HOUR_HEIGHT,
+                content=ft.Text(f"{h:02d}:00", size=9, color=C["text_muted"]),
+                padding=pad(right=4, top=2),
+                alignment=ft.Alignment(1, -1),
+            )
+        )
+    time_col = ft.Column(spacing=0, controls=time_labels)
+
+    grid_stack = ft.Stack(
+        controls=[bg_col] + event_blocks,
+        height=HOUR_HEIGHT * HOURS,
+    )
 
     return ft.Container(
-        bgcolor="transparent",
-        content=ft.Column(spacing=0, controls=rows),
+        bgcolor=C["surface"],
+        border=border_all(1, C["border"]),
+        border_radius=8,
+        content=ft.Column(
+            spacing=0,
+            controls=[
+                # 日付ヘッダー
+                ft.Container(
+                    border=border_only(bottom=ft.BorderSide(1, C["border"])),
+                    padding=pad_sym(h=16, v=10),
+                    bgcolor=C["accent_light"] if is_today else "transparent",
+                    content=ft.Text(
+                        f"{year}年{month}月{day}日（{'今日' if is_today else ''}）",
+                        size=13, weight=ft.FontWeight.W_700,
+                        color=C["accent"] if is_today else C["text_primary"],
+                    ),
+                ),
+                # スクロール可能な時間グリッド
+                ft.Container(
+                    height=min(HOUR_HEIGHT * HOURS, 600),
+                    content=ft.ListView(
+                        expand=True,
+                        controls=[
+                            ft.Row(
+                                spacing=0,
+                                vertical_alignment=ft.CrossAxisAlignment.START,
+                                controls=[
+                                    ft.Container(width=TIME_COL_W, content=time_col),
+                                    ft.Container(expand=True, content=grid_stack),
+                                ],
+                            )
+                        ],
+                    ),
+                ),
+            ],
+        ),
     )
 
 
@@ -1706,7 +1831,7 @@ def build_add_event_dialog(page, on_save):
 # カレンダー：メインパネル
 # ─────────────────────────────────────────────
 
-def build_calendar_panel(page, on_open_company_detail) -> ft.Container:
+def build_calendar_panel(page, on_open_company_detail, detail_wrapper_ref: list) -> ft.Container:
     """
     月/週/日タブ切り替え対応カレンダーパネルを返す。
     - 月ビュー：Googleカレンダー風7×6グリッド
@@ -1733,10 +1858,43 @@ def build_calendar_panel(page, on_open_company_detail) -> ft.Container:
             popup_overlay[0] = None
         page.update()
 
+    def _calc_popup_pos(col: int, row: int) -> tuple[float, float]:
+        """
+        クリックされたセルの列・行番号から、ポップアップの left/top を計算する。
+        page.width をベースにリサイズ追従。画面端にはみ出さないよう補正する。
+        """
+        DETAIL_W   = 380 if detail_wrapper_ref[0] and detail_wrapper_ref[0].width > 0 else 0
+        PADDING    = 32   # 左右padding合計
+        HEADER_H   = 60   # ヘッダー高
+        DASH_H     = 196  # ダッシュボード高（開いている場合）
+        KANBAN_H   = 460  # カンバン高
+        CAL_HDR_H  = 52   # カレンダーヘッダー高
+        WD_ROW_H   = 32   # 曜日ヘッダー行高
+        CELL_H     = 120  # セル高（Issue6で変更済み）
+        POPUP_W    = 270
+        POPUP_H    = 200  # 概算
+
+        cal_w      = (page.width or 1500) - DETAIL_W - PADDING
+        cell_w     = cal_w / 7
+
+        # セル左上の絶対座標（スクロール量は無視、カレンダーエリア内の相対位置）
+        left_base  = PADDING / 2 + col * cell_w
+        top_base   = HEADER_H + DASH_H + KANBAN_H + CAL_HDR_H + WD_ROW_H + row * CELL_H + CELL_H
+
+        # 右端はみ出し補正
+        if left_base + POPUP_W > (page.width or 1500) - DETAIL_W - 10:
+            left_base = left_base - POPUP_W + cell_w
+
+        # 下端はみ出し補正
+        if top_base + POPUP_H > (page.height or 920) - 20:
+            top_base = top_base - POPUP_H - CELL_H
+
+        return max(left_base, 8), max(top_base, HEADER_H + 10)
+
     # ── イベントクリック処理 ──
-    def on_event_click(ev):
+    def on_event_click(ev, col: int = 3, row: int = 2):
         close_popup()
-        kind = classify_event(ev.get("event_type", ""))
+        kind       = classify_event(ev.get("event_type", ""))
         company_id = ev.get("company_id")
 
         # 選考系で企業が紐付く → 右ペインを開く
@@ -1751,14 +1909,16 @@ def build_calendar_panel(page, on_open_company_detail) -> ft.Container:
             on_close_popup=close_popup,
             page=page,
         )
-        # Stack でオーバーレイ表示
+
+        left, top = _calc_popup_pos(col, row)
+
         popup_wrapper = ft.Container(
             content=popup,
-            left=60, top=60,   # Stack 内での仮位置（後述で補正）
+            left=left,
+            top=top,
         )
         stack_overlay = ft.Stack(
             controls=[
-                # 背景タップで閉じる透明レイヤー
                 ft.Container(
                     expand=True,
                     bgcolor="transparent",
@@ -2383,7 +2543,7 @@ def main(page: ft.Page):
     dashboard_ref[0] = dashboard_panel
 
     # ── カレンダーパネル生成 ──
-    calendar_panel = build_calendar_panel(page, on_open_company_detail)
+    calendar_panel = build_calendar_panel(page, on_open_company_detail, [detail_wrapper])
 
     # ── 全体レイアウト ──
     page.add(

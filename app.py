@@ -1286,14 +1286,6 @@ def build_month_view(year: int, month: int,
         except Exception:
             pass
 
-    # 日付→列・行マップ（Issue4: ポップアップ座標計算用）
-    day_col_map: dict[int, int] = {}
-    day_row_map: dict[int, int] = {}
-    for day in range(1, total_days + 1):
-        cell_idx = first_wd + day - 1
-        day_col_map[day] = cell_idx % 7
-        day_row_map[day] = cell_idx // 7
-
     WEEKDAY_LABELS = ["月", "火", "水", "木", "金", "土", "日"]
 
     # ── 曜日ヘッダー ──
@@ -1341,6 +1333,8 @@ def build_month_view(year: int, month: int,
 
         # イベントチップ（最大3件）Issue6: size=11, padding=4
         chip_controls = [day_num]
+        _col = (first_wd + day - 1) % 7
+        _row = (first_wd + day - 1) // 7
         for ev in evs[:3]:
             fg, bg = cal_event_color(ev.get("event_type", ""))
             label  = ev.get("event_type", "")[:10]
@@ -1357,7 +1351,7 @@ def build_month_view(year: int, month: int,
                     border=border_all(1, fg) if is_gcal else None,
                     padding=pad_sym(h=6, v=4),
                     margin=mar(bottom=2),
-                    on_click=lambda e, ev=ev: on_event_click(ev, col=day_col_map.get(day, 0), row=day_row_map.get(day, 0)),
+                    on_click=lambda e, ev=ev, c=_col, r=_row: on_event_click(ev, col=c, row=r),
                 )
             )
         if len(evs) > 3:
